@@ -31,7 +31,8 @@ series to protect TSDB backends from unbounded label growth.
 
 ## Optional OTLP Metrics Export
 
-Enable the `otlp-metrics` feature to use the OTLP metrics push bridge:
+Enable the `otlp-metrics` feature to use the native OpenTelemetry OTLP
+metrics push exporter:
 
 ```toml
 [dependencies]

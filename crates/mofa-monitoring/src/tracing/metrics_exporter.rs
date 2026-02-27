@@ -1,16 +1,22 @@
-//! Optional OTLP metrics exporter bridge.
+//! Optional native OTLP metrics exporter.
 //!
-//! This exporter reuses `MetricsCollector` snapshots and pushes OTLP-like JSON
-//! payloads to a collector endpoint on a periodic interval.
+//! This exporter reuses `MetricsCollector` snapshots and records them through
+//! OpenTelemetry metric instruments backed by the native OTLP exporter pipeline.
 
 use crate::{CardinalityLimits, MetricsCollector, MetricsSnapshot};
-use reqwest::Client;
-use serde_json::json;
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Meter, MeterProvider, UpDownCounter},
+};
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{Resource, metrics::MeterProvider as SdkMeterProvider, runtime::Tokio};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use std::time::Duration;
+use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
 use tracing::{debug, warn};
 
 const OTHER_LABEL_VALUE: &str = "__other__";
@@ -18,17 +24,17 @@ const OTHER_LABEL_VALUE: &str = "__other__";
 /// OTLP metrics exporter configuration.
 #[derive(Debug, Clone)]
 pub struct OtlpMetricsExporterConfig {
-    /// OTLP collector HTTP endpoint.
+    /// OTLP collector endpoint.
     pub endpoint: String,
     /// Snapshot sampling interval.
     pub collect_interval: Duration,
-    /// Export flush interval.
+    /// Native OTLP export interval.
     pub export_interval: Duration,
-    /// Max snapshots per batch.
+    /// Max snapshots processed in a single worker tick.
     pub batch_size: usize,
     /// Max in-memory queue size.
     pub max_queue_size: usize,
-    /// HTTP timeout per export request.
+    /// OTLP export timeout.
     pub timeout: Duration,
     /// Service name attribute.
     pub service_name: String,
@@ -83,9 +89,8 @@ pub struct OtlpExporterHandles {
 pub struct OtlpMetricsExporter {
     collector: Arc<MetricsCollector>,
     config: OtlpMetricsExporterConfig,
-    client: Client,
     sender: mpsc::Sender<MetricsSnapshot>,
-    receiver: Mutex<Option<mpsc::Receiver<MetricsSnapshot>>>,
+    receiver: AsyncMutex<Option<mpsc::Receiver<MetricsSnapshot>>>,
     dropped_snapshots: AtomicU64,
     last_error: Arc<RwLock<Option<String>>>,
 }
@@ -105,9 +110,8 @@ impl OtlpMetricsExporter {
         Self {
             collector,
             config,
-            client: Client::new(),
             sender,
-            receiver: Mutex::new(Some(receiver)),
+            receiver: AsyncMutex::new(Some(receiver)),
             dropped_snapshots: AtomicU64::new(0),
             last_error: Arc::new(RwLock::new(None)),
         }
@@ -126,6 +130,8 @@ impl OtlpMetricsExporter {
         let Some(mut receiver) = self.receiver.lock().await.take() else {
             return Err("OTLP metrics exporter already started".to_string());
         };
+
+        let recorder = Arc::new(OtlpRecorder::new(&self.config)?);
 
         let sampler = {
             let this = self.clone();
@@ -151,80 +157,327 @@ impl OtlpMetricsExporter {
 
         let exporter = {
             let this = self.clone();
+            let recorder = recorder.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(this.config.export_interval);
                 let mut batch = Vec::with_capacity(this.config.batch_size);
 
-                loop {
-                    tokio::select! {
-                        maybe_snapshot = receiver.recv() => {
-                            match maybe_snapshot {
-                                Some(snapshot) => {
-                                    batch.push(snapshot);
-                                    if batch.len() >= this.config.batch_size {
-                                        flush_batch(&this, &mut batch).await;
-                                    }
-                                }
-                                None => break,
-                            }
-                        }
-                        _ = interval.tick() => {
-                            if !batch.is_empty() {
-                                flush_batch(&this, &mut batch).await;
-                            }
+                while let Some(snapshot) = receiver.recv().await {
+                    batch.push(snapshot);
+                    while batch.len() < this.config.batch_size {
+                        match receiver.try_recv() {
+                            Ok(snapshot) => batch.push(snapshot),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                         }
                     }
+
+                    flush_batch(&this, &recorder, &mut batch).await;
                 }
 
                 if !batch.is_empty() {
-                    flush_batch(&this, &mut batch).await;
+                    flush_batch(&this, &recorder, &mut batch).await;
                 }
             })
         };
 
         Ok(OtlpExporterHandles { sampler, exporter })
     }
+}
 
-    async fn export_batch(&self, batch: &[MetricsSnapshot]) -> Result<(), String> {
-        if batch.is_empty() {
-            return Ok(());
+struct OtlpRecorder {
+    // Keep provider alive for background periodic export.
+    _meter_provider: SdkMeterProvider,
+    instruments: OtlpInstruments,
+    cardinality: CardinalityLimits,
+    last_values: StdMutex<LastSeriesState>,
+}
+
+impl OtlpRecorder {
+    fn new(config: &OtlpMetricsExporterConfig) -> Result<Self, String> {
+        let exporter = opentelemetry_otlp::new_exporter()
+            .http()
+            .with_endpoint(config.endpoint.clone())
+            .with_timeout(config.timeout);
+
+        let meter_provider = opentelemetry_otlp::new_pipeline()
+            .metrics(Tokio)
+            .with_exporter(exporter)
+            .with_period(config.export_interval)
+            .with_timeout(config.timeout)
+            .with_resource(Resource::new(vec![KeyValue::new(
+                "service.name",
+                config.service_name.clone(),
+            )]))
+            .build()
+            .map_err(|err| format!("failed to build native OTLP meter provider: {err}"))?;
+
+        let meter = meter_provider.meter("mofa-monitoring.metrics-exporter");
+        let instruments = OtlpInstruments::new(&meter);
+
+        Ok(Self {
+            _meter_provider: meter_provider,
+            instruments,
+            cardinality: config.cardinality.clone(),
+            last_values: StdMutex::new(LastSeriesState::default()),
+        })
+    }
+
+    fn record_snapshot(&self, snapshot: &MetricsSnapshot) {
+        let mut dropped = DroppedSeriesCounters::default();
+        let mut state = self
+            .last_values
+            .lock()
+            .expect("otlp metrics exporter state mutex poisoned");
+
+        self.apply_labeled_values(
+            &self.instruments.system_cpu_percent,
+            vec![LabeledPoint {
+                labels: vec![],
+                rank: snapshot.system.cpu_usage,
+                value: snapshot.system.cpu_usage,
+            }],
+            &mut state.system_cpu_percent,
+        );
+
+        self.apply_labeled_values(
+            &self.instruments.system_memory_bytes,
+            vec![LabeledPoint {
+                labels: vec![],
+                rank: snapshot.system.memory_used as f64,
+                value: snapshot.system.memory_used as f64,
+            }],
+            &mut state.system_memory_bytes,
+        );
+
+        let (agent_values, dropped_agents) = cap_points(
+            snapshot
+                .agents
+                .iter()
+                .map(|agent| LabeledPoint {
+                    labels: vec![("agent_id".to_string(), agent.agent_id.clone())],
+                    rank: agent.tasks_completed as f64,
+                    value: agent.tasks_completed as f64,
+                })
+                .collect(),
+            self.cardinality.agent_id,
+        );
+        dropped.agent_id = dropped_agents;
+        self.apply_labeled_values(
+            &self.instruments.agent_tasks_total,
+            agent_values,
+            &mut state.agent_tasks_total,
+        );
+
+        let (workflow_values, dropped_workflows) = cap_points(
+            snapshot
+                .workflows
+                .iter()
+                .map(|workflow| LabeledPoint {
+                    labels: vec![("workflow_id".to_string(), workflow.workflow_id.clone())],
+                    rank: workflow.total_executions as f64,
+                    value: workflow.total_executions as f64,
+                })
+                .collect(),
+            self.cardinality.workflow_id,
+        );
+        dropped.workflow_id = dropped_workflows;
+        self.apply_labeled_values(
+            &self.instruments.workflow_executions_total,
+            workflow_values,
+            &mut state.workflow_executions_total,
+        );
+
+        let (tool_values, dropped_tools) = cap_points(
+            snapshot
+                .plugins
+                .iter()
+                .map(|plugin| LabeledPoint {
+                    labels: vec![("tool_name".to_string(), plugin.name.clone())],
+                    rank: plugin.call_count as f64,
+                    value: plugin.call_count as f64,
+                })
+                .collect(),
+            self.cardinality.plugin_or_tool,
+        );
+        dropped.plugin_or_tool = dropped_tools;
+        self.apply_labeled_values(
+            &self.instruments.tool_call_count,
+            tool_values,
+            &mut state.tool_call_count,
+        );
+
+        let (llm_values, dropped_provider_model) = cap_points(
+            snapshot
+                .llm_metrics
+                .iter()
+                .map(|llm| LabeledPoint {
+                    labels: vec![
+                        ("provider".to_string(), llm.provider_name.clone()),
+                        ("model".to_string(), llm.model_name.clone()),
+                    ],
+                    rank: llm.total_requests as f64,
+                    value: llm.total_requests as f64,
+                })
+                .collect(),
+            self.cardinality.provider_model,
+        );
+        dropped.provider_model = dropped_provider_model;
+        self.apply_labeled_values(
+            &self.instruments.llm_requests_total,
+            llm_values,
+            &mut state.llm_requests_total,
+        );
+
+        self.record_dropped_series(dropped);
+    }
+
+    fn apply_labeled_values(
+        &self,
+        instrument: &UpDownCounter<f64>,
+        values: Vec<LabeledPoint>,
+        state: &mut HashMap<String, SeriesValue>,
+    ) {
+        let mut next = HashMap::with_capacity(values.len());
+
+        for value in values {
+            let key = label_key(&value.labels);
+            next.insert(
+                key,
+                SeriesValue {
+                    labels: value.labels,
+                    value: value.value,
+                },
+            );
         }
 
-        let payload =
-            build_otlp_payload(batch, &self.config.cardinality, &self.config.service_name);
-
-        let response = self
-            .client
-            .post(&self.config.endpoint)
-            .timeout(self.config.timeout)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| format!("failed to send OTLP metrics request: {err}"))?;
-
-        if !response.status().is_success() {
-            return Err(format!(
-                "OTLP metrics export failed with status {}",
-                response.status()
-            ));
+        for (key, series) in &next {
+            let prev = state.get(key).map(|old| old.value).unwrap_or(0.0);
+            let delta = series.value - prev;
+            if is_non_zero(delta) {
+                let attrs = to_attributes(&series.labels);
+                instrument.add(delta, &attrs);
+            }
         }
 
-        Ok(())
+        for (key, series) in state.iter() {
+            if !next.contains_key(key) && is_non_zero(series.value) {
+                let attrs = to_attributes(&series.labels);
+                instrument.add(-series.value, &attrs);
+            }
+        }
+
+        *state = next;
+    }
+
+    fn record_dropped_series(&self, dropped: DroppedSeriesCounters) {
+        if dropped.agent_id > 0 {
+            self.instruments.dropped_series_total.add(
+                dropped.agent_id as u64,
+                &[KeyValue::new("label", "agent_id")],
+            );
+        }
+        if dropped.workflow_id > 0 {
+            self.instruments.dropped_series_total.add(
+                dropped.workflow_id as u64,
+                &[KeyValue::new("label", "workflow_id")],
+            );
+        }
+        if dropped.plugin_or_tool > 0 {
+            self.instruments.dropped_series_total.add(
+                dropped.plugin_or_tool as u64,
+                &[KeyValue::new("label", "plugin_or_tool")],
+            );
+        }
+        if dropped.provider_model > 0 {
+            self.instruments.dropped_series_total.add(
+                dropped.provider_model as u64,
+                &[KeyValue::new("label", "provider_model")],
+            );
+        }
     }
 }
 
-async fn flush_batch(exporter: &OtlpMetricsExporter, batch: &mut Vec<MetricsSnapshot>) {
-    let payload = std::mem::take(batch);
-    if let Err(err) = exporter.export_batch(&payload).await {
-        warn!("otlp metrics export failed: {err}");
-        *exporter.last_error.write().await = Some(err);
-    } else {
-        debug!(
-            "exported {} snapshot(s) to OTLP metrics endpoint",
-            payload.len()
-        );
-        *exporter.last_error.write().await = None;
+struct OtlpInstruments {
+    system_cpu_percent: UpDownCounter<f64>,
+    system_memory_bytes: UpDownCounter<f64>,
+    agent_tasks_total: UpDownCounter<f64>,
+    workflow_executions_total: UpDownCounter<f64>,
+    tool_call_count: UpDownCounter<f64>,
+    llm_requests_total: UpDownCounter<f64>,
+    dropped_series_total: Counter<u64>,
+}
+
+impl OtlpInstruments {
+    fn new(meter: &Meter) -> Self {
+        Self {
+            system_cpu_percent: meter
+                .f64_up_down_counter("mofa.system.cpu.percent")
+                .with_description("System CPU usage percentage")
+                .init(),
+            system_memory_bytes: meter
+                .f64_up_down_counter("mofa.system.memory.bytes")
+                .with_description("System memory usage in bytes")
+                .init(),
+            agent_tasks_total: meter
+                .f64_up_down_counter("mofa.agent.tasks.total")
+                .with_description("Total tasks completed by agent")
+                .init(),
+            workflow_executions_total: meter
+                .f64_up_down_counter("mofa.workflow.executions.total")
+                .with_description("Total workflow executions")
+                .init(),
+            tool_call_count: meter
+                .f64_up_down_counter("mofa.tool.calls.total")
+                .with_description("Total tool or plugin call count")
+                .init(),
+            llm_requests_total: meter
+                .f64_up_down_counter("mofa.llm.requests.total")
+                .with_description("Total LLM requests")
+                .init(),
+            dropped_series_total: meter
+                .u64_counter("mofa.exporter.dropped_series.total")
+                .with_description("Total dropped metric series due to cardinality limits")
+                .init(),
+        }
     }
+}
+
+#[derive(Default)]
+struct LastSeriesState {
+    system_cpu_percent: HashMap<String, SeriesValue>,
+    system_memory_bytes: HashMap<String, SeriesValue>,
+    agent_tasks_total: HashMap<String, SeriesValue>,
+    workflow_executions_total: HashMap<String, SeriesValue>,
+    tool_call_count: HashMap<String, SeriesValue>,
+    llm_requests_total: HashMap<String, SeriesValue>,
+}
+
+#[derive(Clone)]
+struct SeriesValue {
+    labels: Vec<(String, String)>,
+    value: f64,
+}
+
+async fn flush_batch(
+    exporter: &OtlpMetricsExporter,
+    recorder: &OtlpRecorder,
+    batch: &mut Vec<MetricsSnapshot>,
+) {
+    let snapshots = std::mem::take(batch);
+    for snapshot in snapshots {
+        recorder.record_snapshot(&snapshot);
+    }
+
+    debug!("recorded snapshot batch into native OTLP meter provider");
+    *exporter.last_error.write().await = None;
+}
+
+#[derive(Default, Debug, Clone)]
+struct DroppedSeriesCounters {
+    agent_id: usize,
+    workflow_id: usize,
+    plugin_or_tool: usize,
+    provider_model: usize,
 }
 
 #[derive(Clone)]
@@ -234,136 +487,17 @@ struct LabeledPoint {
     value: f64,
 }
 
-fn build_otlp_payload(
-    batch: &[MetricsSnapshot],
-    limits: &CardinalityLimits,
-    service_name: &str,
-) -> serde_json::Value {
-    if batch.is_empty() {
-        return json!({"resourceMetrics": []});
-    }
-
-    let mut system_cpu_points = Vec::with_capacity(batch.len());
-    let mut system_memory_points = Vec::with_capacity(batch.len());
-    let mut agent_points = Vec::new();
-    let mut workflow_points = Vec::new();
-    let mut tool_points = Vec::new();
-    let mut llm_points = Vec::new();
-
-    for snapshot in batch {
-        let ts_nanos = snapshot_time_nanos(snapshot);
-        system_cpu_points.push(point(ts_nanos, vec![], snapshot.system.cpu_usage));
-        system_memory_points.push(point(ts_nanos, vec![], snapshot.system.memory_used as f64));
-
-        agent_points.extend(otlp_points(
-            ts_nanos,
-            cap_points(
-                snapshot
-                    .agents
-                    .iter()
-                    .map(|agent| LabeledPoint {
-                        labels: vec![("agent_id".to_string(), agent.agent_id.clone())],
-                        rank: agent.tasks_completed as f64,
-                        value: agent.tasks_completed as f64,
-                    })
-                    .collect(),
-                limits.agent_id,
-            ),
-        ));
-
-        workflow_points.extend(otlp_points(
-            ts_nanos,
-            cap_points(
-                snapshot
-                    .workflows
-                    .iter()
-                    .map(|workflow| LabeledPoint {
-                        labels: vec![("workflow_id".to_string(), workflow.workflow_id.clone())],
-                        rank: workflow.total_executions as f64,
-                        value: workflow.total_executions as f64,
-                    })
-                    .collect(),
-                limits.workflow_id,
-            ),
-        ));
-
-        tool_points.extend(otlp_points(
-            ts_nanos,
-            cap_points(
-                snapshot
-                    .plugins
-                    .iter()
-                    .map(|plugin| LabeledPoint {
-                        labels: vec![("tool_name".to_string(), plugin.name.clone())],
-                        rank: plugin.call_count as f64,
-                        value: plugin.call_count as f64,
-                    })
-                    .collect(),
-                limits.plugin_or_tool,
-            ),
-        ));
-
-        llm_points.extend(otlp_points(
-            ts_nanos,
-            cap_points(
-                snapshot
-                    .llm_metrics
-                    .iter()
-                    .map(|llm| LabeledPoint {
-                        labels: vec![
-                            ("provider".to_string(), llm.provider_name.clone()),
-                            ("model".to_string(), llm.model_name.clone()),
-                        ],
-                        rank: llm.total_requests as f64,
-                        value: llm.total_requests as f64,
-                    })
-                    .collect(),
-                limits.provider_model,
-            ),
-        ));
-    }
-
-    json!({
-        "resourceMetrics": [{
-            "resource": {
-                "attributes": [
-                    {
-                        "key": "service.name",
-                        "value": { "stringValue": service_name }
-                    }
-                ]
-            },
-            "scopeMetrics": [{
-                "scope": { "name": "mofa-monitoring.metrics-exporter" },
-                "metrics": [
-                    metric_gauge("mofa.system.cpu.percent", system_cpu_points),
-                    metric_gauge("mofa.system.memory.bytes", system_memory_points),
-                    metric_gauge("mofa.agent.tasks.total", agent_points),
-                    metric_gauge("mofa.workflow.executions.total", workflow_points),
-                    metric_gauge("mofa.tool.calls.total", tool_points),
-                    metric_gauge("mofa.llm.requests.total", llm_points),
-                ]
-            }]
-        }]
-    })
+fn to_attributes(labels: &[(String, String)]) -> Vec<KeyValue> {
+    labels
+        .iter()
+        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+        .collect()
 }
 
-fn snapshot_time_nanos(snapshot: &MetricsSnapshot) -> u64 {
-    if snapshot.timestamp > 0 {
-        return snapshot.timestamp.saturating_mul(1_000_000_000);
-    }
-
-    let now_nanos_u128 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    u64::try_from(now_nanos_u128).unwrap_or(u64::MAX)
-}
-
-fn cap_points(mut points: Vec<LabeledPoint>, limit: usize) -> Vec<LabeledPoint> {
+fn cap_points(mut points: Vec<LabeledPoint>, limit: usize) -> (Vec<LabeledPoint>, usize) {
     if points.len() <= limit {
         points.sort_by(|a, b| compare_labels(&a.labels, &b.labels));
-        return points;
+        return (points, 0);
     }
 
     points.sort_by(|a, b| {
@@ -373,8 +507,9 @@ fn cap_points(mut points: Vec<LabeledPoint>, limit: usize) -> Vec<LabeledPoint> 
             .then_with(|| compare_labels(&a.labels, &b.labels))
     });
 
-    let mut kept = points.drain(..limit).collect::<Vec<_>>();
+    let mut kept = points.drain(..limit.min(points.len())).collect::<Vec<_>>();
     let overflow = points;
+    let dropped_count = overflow.len();
 
     let overflow_value = overflow
         .into_iter()
@@ -397,160 +532,90 @@ fn cap_points(mut points: Vec<LabeledPoint>, limit: usize) -> Vec<LabeledPoint> 
         value: overflow_value,
     });
     kept.sort_by(|a, b| compare_labels(&a.labels, &b.labels));
-    kept
+    (kept, dropped_count)
 }
 
 fn compare_labels(a: &[(String, String)], b: &[(String, String)]) -> Ordering {
-    let a_key = a
+    label_key(a).cmp(&label_key(b))
+}
+
+fn label_key(labels: &[(String, String)]) -> String {
+    labels
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
-        .join("|");
-    let b_key = b
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("|");
-    a_key.cmp(&b_key)
+        .join("|")
 }
 
-fn point(timestamp_unix_nano: u64, labels: Vec<(String, String)>, value: f64) -> serde_json::Value {
-    let attributes = labels
-        .into_iter()
-        .map(|(k, v)| {
-            json!({
-                "key": k,
-                "value": { "stringValue": v }
-            })
-        })
-        .collect::<Vec<_>>();
-
-    json!({
-        "timeUnixNano": timestamp_unix_nano,
-        "asDouble": value,
-        "attributes": attributes,
-    })
-}
-
-fn otlp_points(timestamp_unix_nano: u64, points: Vec<LabeledPoint>) -> Vec<serde_json::Value> {
-    points
-        .into_iter()
-        .map(|point_data| point(timestamp_unix_nano, point_data.labels, point_data.value))
-        .collect()
-}
-
-fn metric_gauge(name: &str, data_points: Vec<serde_json::Value>) -> serde_json::Value {
-    json!({
-        "name": name,
-        "unit": "1",
-        "gauge": {
-            "dataPoints": data_points
-        }
-    })
+fn is_non_zero(value: f64) -> bool {
+    value.abs() > f64::EPSILON
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample_snapshot() -> MetricsSnapshot {
-        MetricsSnapshot {
-            system: crate::SystemMetrics {
-                cpu_usage: 20.0,
-                memory_used: 100,
-                memory_total: 200,
-                uptime_secs: 10,
-                thread_count: 3,
-                timestamp: 1,
+    #[test]
+    fn cap_points_adds_other_bucket_when_limit_exceeded() {
+        let points = vec![
+            LabeledPoint {
+                labels: vec![("agent_id".to_string(), "a".to_string())],
+                rank: 10.0,
+                value: 10.0,
             },
-            agents: vec![crate::AgentMetrics {
-                agent_id: "agent-1".to_string(),
-                tasks_completed: 8,
-                ..Default::default()
-            }],
-            workflows: vec![crate::WorkflowMetrics {
-                workflow_id: "wf-1".to_string(),
-                total_executions: 4,
-                ..Default::default()
-            }],
-            plugins: vec![crate::PluginMetrics {
-                name: "search".to_string(),
-                call_count: 11,
-                ..Default::default()
-            }],
-            llm_metrics: vec![crate::LLMMetrics {
-                provider_name: "openai".to_string(),
-                model_name: "gpt-4o-mini".to_string(),
-                total_requests: 6,
-                ..Default::default()
-            }],
-            timestamp: 1,
-            custom: std::collections::HashMap::new(),
-        }
+            LabeledPoint {
+                labels: vec![("agent_id".to_string(), "b".to_string())],
+                rank: 8.0,
+                value: 8.0,
+            },
+            LabeledPoint {
+                labels: vec![("agent_id".to_string(), "c".to_string())],
+                rank: 5.0,
+                value: 5.0,
+            },
+        ];
+
+        let (capped, dropped) = cap_points(points, 2);
+        assert_eq!(dropped, 1);
+        assert_eq!(capped.len(), 3);
+
+        let has_other = capped.iter().any(|entry| {
+            entry
+                .labels
+                .iter()
+                .any(|(k, v)| k == "agent_id" && v == "__other__")
+        });
+        assert!(has_other);
     }
 
     #[test]
-    fn payload_contains_core_metrics() {
-        let snapshot = sample_snapshot();
-        let payload = build_otlp_payload(&[snapshot], &CardinalityLimits::default(), "mofa");
+    fn cap_points_keeps_deterministic_order() {
+        let points = vec![
+            LabeledPoint {
+                labels: vec![("k".to_string(), "b".to_string())],
+                rank: 1.0,
+                value: 1.0,
+            },
+            LabeledPoint {
+                labels: vec![("k".to_string(), "a".to_string())],
+                rank: 1.0,
+                value: 1.0,
+            },
+        ];
 
-        let payload_str = payload.to_string();
-        assert!(payload_str.contains("mofa.agent.tasks.total"));
-        assert!(payload_str.contains("mofa.workflow.executions.total"));
-        assert!(payload_str.contains("mofa.tool.calls.total"));
-        assert!(payload_str.contains("mofa.llm.requests.total"));
+        let (capped, dropped) = cap_points(points, 10);
+        assert_eq!(dropped, 0);
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].labels[0].1, "a");
+        assert_eq!(capped[1].labels[0].1, "b");
     }
 
     #[test]
-    fn payload_caps_cardinality_with_other_bucket() {
-        let mut snapshot = sample_snapshot();
-        snapshot.agents = (0..110)
-            .map(|idx| crate::AgentMetrics {
-                agent_id: format!("agent-{idx}"),
-                tasks_completed: idx as u64,
-                ..Default::default()
-            })
-            .collect();
-
-        let limits = CardinalityLimits {
-            agent_id: 3,
-            ..Default::default()
-        };
-        let payload = build_otlp_payload(&[snapshot], &limits, "mofa");
-        let payload_str = payload.to_string();
-
-        assert!(payload_str.contains("__other__"));
-    }
-
-    #[test]
-    fn payload_includes_all_batch_snapshots() {
-        let mut first = sample_snapshot();
-        first.timestamp = 1;
-        first.system.cpu_usage = 10.0;
-        let mut second = sample_snapshot();
-        second.timestamp = 2;
-        second.system.cpu_usage = 20.0;
-
-        let payload = build_otlp_payload(&[first, second], &CardinalityLimits::default(), "mofa");
-        let payload_str = payload.to_string();
-
-        assert!(payload_str.contains("\"timeUnixNano\":1000000000"));
-        assert!(payload_str.contains("\"timeUnixNano\":2000000000"));
-    }
-
-    // macOS CI/sandbox intermittently fails constructing network-backed HTTP client stacks
-    // in this failure-path test; keep coverage on other targets where behavior is stable.
-    #[cfg(not(target_os = "macos"))]
-    #[tokio::test]
-    async fn export_failure_surfaces_error_without_panic() {
-        let collector = Arc::new(MetricsCollector::new(Default::default()));
-
-        let exporter = OtlpMetricsExporter::new(
-            collector.clone(),
-            OtlpMetricsExporterConfig::default().with_endpoint("http://127.0.0.1:1/v1/metrics"),
-        );
-
-        let result = exporter.export_batch(&[sample_snapshot()]).await;
-        assert!(result.is_err());
+    fn label_key_is_stable_for_same_ordered_labels() {
+        let labels = vec![
+            ("provider".to_string(), "openai".to_string()),
+            ("model".to_string(), "gpt-4o-mini".to_string()),
+        ];
+        assert_eq!(label_key(&labels), "provider=openai|model=gpt-4o-mini");
     }
 }
