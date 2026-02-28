@@ -3,9 +3,11 @@
 mod cli;
 mod commands;
 mod config;
+mod plugin_catalog;
 mod context;
 mod output;
 mod render;
+mod state;
 mod store;
 mod tui;
 mod utils;
@@ -156,8 +158,24 @@ async fn run_command(cli: Cli) -> anyhow::Result<()> {
                 cli::AgentCommands::List { running, all } => {
                     commands::agent::list::run(ctx, running, all).await?;
                 }
-                cli::AgentCommands::Logs { agent_id, tail } => {
-                    commands::agent::logs::run(ctx, &agent_id, tail).await?;
+                cli::AgentCommands::Logs {
+                    agent_id,
+                    tail,
+                    level,
+                    grep,
+                    limit,
+                    json,
+                } => {
+                    commands::agent::logs::run(
+                        ctx,
+                        &agent_id,
+                        tail,
+                        level.clone(),
+                        grep.clone(),
+                        limit,
+                        json,
+                    )
+                    .await?;
                 }
             }
         }
@@ -196,12 +214,40 @@ async fn run_command(cli: Cli) -> anyhow::Result<()> {
                 cli::PluginCommands::Info { name } => {
                     commands::plugin::info::run(ctx, &name).await?;
                 }
-                cli::PluginCommands::Install { name } => {
-                    commands::plugin::install::run(ctx, &name).await?;
+                cli::PluginCommands::Install {
+                    name,
+                    checksum,
+                    verify_signature,
+                } => {
+                    commands::plugin::install::run(
+                        ctx,
+                        &name,
+                        checksum.as_deref(),
+                        verify_signature,
+                    )
+                    .await?;
                 }
                 cli::PluginCommands::Uninstall { name, force } => {
                     commands::plugin::uninstall::run(ctx, &name, force).await?;
                 }
+                cli::PluginCommands::Repository { action } => match action {
+                    cli::PluginRepositoryCommands::List => {
+                        commands::plugin::repository::list(ctx).await?;
+                    }
+                    cli::PluginRepositoryCommands::Add {
+                        id,
+                        url,
+                        description,
+                    } => {
+                        commands::plugin::repository::add(
+                            ctx,
+                            &id,
+                            &url,
+                            description.as_deref(),
+                        )
+                        .await?;
+                    }
+                },
             }
         }
 
@@ -284,14 +330,8 @@ fn normalize_legacy_output_flags(args: &mut [String]) {
     });
 
     let allows_global_after_command = match top_command {
-        Some("info")
-        | Some("agent")
-        | Some("plugin")
-        | Some("tool")
-        | Some("config")
-        | Some("build")
-        | Some("run")
-        | Some("init") => true,
+        Some("info") | Some("agent") | Some("plugin") | Some("tool") | Some("config")
+        | Some("build") | Some("run") | Some("init") => true,
         // `session show` and `session export` both define their own local -o flag, so skip
         // normalisation for those subcommands.  All other `session` subcommands (e.g. `list`)
         // use the global output-format flag and should be normalised.

@@ -1,6 +1,9 @@
 //! CLI context providing access to backend services
 
+use crate::state::PersistentAgentRegistry;
+use crate::plugin_catalog::{default_repos, DEFAULT_PLUGIN_REPO_ID, PluginRepoEntry};
 use crate::store::PersistedStore;
+use crate::utils::AgentProcessManager;
 use crate::utils::paths;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -9,6 +12,7 @@ use mofa_foundation::agent::components::tool::EchoTool;
 use mofa_foundation::agent::session::SessionManager;
 use mofa_foundation::agent::tools::registry::{ToolRegistry, ToolSource};
 use mofa_kernel::agent::AgentCapabilities;
+use mofa_kernel::agent::components::tool::ToolExt;
 use mofa_kernel::agent::config::AgentConfig;
 use mofa_kernel::agent::core::MoFAAgent;
 use mofa_kernel::agent::error::{AgentError, AgentResult};
@@ -54,6 +58,10 @@ pub struct PluginSpecEntry {
     pub kind: String,
     pub enabled: bool,
     pub config: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +84,12 @@ pub struct CliContext {
     pub plugin_store: PersistedStore<PluginSpecEntry>,
     /// Persistent tool source specifications
     pub tool_store: PersistedStore<ToolSpecEntry>,
+    /// Persistent plugin repository definitions
+    pub plugin_repo_store: PersistedStore<PluginRepoEntry>,
+    /// Persistent agent state storage
+    pub persistent_agents: Arc<PersistentAgentRegistry>,
+    /// Agent process manager for spawning/managing processes
+    pub process_manager: AgentProcessManager,
     /// In-memory plugin registry
     pub plugin_registry: Arc<SimplePluginRegistry>,
     /// In-memory tool registry
@@ -101,12 +115,21 @@ impl CliContext {
         register_default_agent_factories(&agent_registry).await?;
         let plugin_store = PersistedStore::new(data_dir.join("plugins"))?;
         let tool_store = PersistedStore::new(data_dir.join("tools"))?;
+        let plugin_repo_store = PersistedStore::new(data_dir.join("plugin_repos"))?;
         seed_default_specs(&plugin_store, &tool_store)?;
+        seed_default_repos(&plugin_repo_store)?;
 
         let plugin_registry = Arc::new(SimplePluginRegistry::new());
         replay_persisted_plugins(&plugin_registry, &plugin_store)?;
         let mut tool_registry = ToolRegistry::new();
         replay_persisted_tools(&mut tool_registry, &tool_store)?;
+
+        let agents_dir = data_dir.join("agents");
+        let persistent_agents = Arc::new(PersistentAgentRegistry::new(agents_dir).await.map_err(
+            |e| anyhow::anyhow!("Failed to initialize persistent agent registry: {}", e),
+        )?);
+
+        let process_manager = AgentProcessManager::new(config_dir.clone());
 
         Ok(Self {
             session_manager,
@@ -114,6 +137,9 @@ impl CliContext {
             agent_store,
             plugin_store,
             tool_store,
+            plugin_repo_store,
+            persistent_agents,
+            process_manager,
             plugin_registry,
             tool_registry,
             data_dir,
@@ -139,12 +165,21 @@ impl CliContext {
         register_default_agent_factories(&agent_registry).await?;
         let plugin_store = PersistedStore::new(data_dir.join("plugins"))?;
         let tool_store = PersistedStore::new(data_dir.join("tools"))?;
+        let plugin_repo_store = PersistedStore::new(data_dir.join("plugin_repos"))?;
         seed_default_specs(&plugin_store, &tool_store)?;
+        seed_default_repos(&plugin_repo_store)?;
 
         let plugin_registry = Arc::new(SimplePluginRegistry::new());
         replay_persisted_plugins(&plugin_registry, &plugin_store)?;
         let mut tool_registry = ToolRegistry::new();
         replay_persisted_tools(&mut tool_registry, &tool_store)?;
+
+        let agents_dir = data_dir.join("agents");
+        let persistent_agents = Arc::new(PersistentAgentRegistry::new(agents_dir).await.map_err(
+            |e| anyhow::anyhow!("Failed to initialize persistent agent registry: {}", e),
+        )?);
+
+        let process_manager = AgentProcessManager::new(config_dir.clone());
 
         Ok(Self {
             session_manager,
@@ -152,6 +187,9 @@ impl CliContext {
             agent_store,
             plugin_store,
             tool_store,
+            plugin_repo_store,
+            persistent_agents,
+            process_manager,
             plugin_registry,
             tool_registry,
             data_dir,
@@ -240,6 +278,8 @@ fn seed_default_specs(
         config: serde_json::json!({
             "url": "https://example.com",
         }),
+        description: Some("Built-in HTTP helper plugin".to_string()),
+        repo_id: Some(DEFAULT_PLUGIN_REPO_ID.to_string()),
     };
     if plugin_store.get(&default_plugin.id)?.is_none() {
         plugin_store.save(&default_plugin.id, &default_plugin)?;
@@ -258,6 +298,36 @@ fn seed_default_specs(
     Ok(())
 }
 
+/// Instantiate a plugin from a persisted spec entry.
+///
+/// Returns `Some(plugin)` for recognised builtin kinds, or `None` for
+/// unknown kinds (forward-compatible).
+pub fn instantiate_plugin_from_spec(
+    spec: &PluginSpecEntry,
+) -> Option<Arc<dyn mofa_kernel::agent::plugins::Plugin>> {
+    match spec.kind.as_str() {
+        BUILTIN_HTTP_PLUGIN_KIND => {
+            let url = spec
+                .config
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("https://example.com");
+            Some(Arc::new(HttpPlugin::new(url)))
+        }
+        _ => None,
+    }
+}
+
+fn seed_default_repos(store: &PersistedStore<PluginRepoEntry>) -> anyhow::Result<()> {
+    if !store.list()?.is_empty() {
+        return Ok(());
+    }
+    for repo in default_repos() {
+        store.save(&repo.id, &repo)?;
+    }
+    Ok(())
+}
+
 fn replay_persisted_plugins(
     plugin_registry: &Arc<SimplePluginRegistry>,
     plugin_store: &PersistedStore<PluginSpecEntry>,
@@ -267,22 +337,10 @@ fn replay_persisted_plugins(
             continue;
         }
 
-        match spec.kind.as_str() {
-            BUILTIN_HTTP_PLUGIN_KIND => {
-                let url = spec
-                    .config
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("https://example.com");
-                plugin_registry
-                    .register(Arc::new(HttpPlugin::new(url)))
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to register plugin '{}': {}", spec.id, e)
-                    })?;
-            }
-            _ => {
-                // Ignore unknown kinds for forward compatibility.
-            }
+        if let Some(plugin) = instantiate_plugin_from_spec(&spec) {
+            plugin_registry
+                .register(plugin)
+                .map_err(|e| anyhow::anyhow!("Failed to register plugin '{}': {}", spec.id, e))?;
         }
     }
 
@@ -301,7 +359,7 @@ fn replay_persisted_tools(
         match spec.kind.as_str() {
             BUILTIN_ECHO_TOOL_KIND => {
                 tool_registry
-                    .register_with_source(Arc::new(EchoTool), ToolSource::Builtin)
+                    .register_with_source(EchoTool.into_dynamic(), ToolSource::Builtin)
                     .map_err(|e| anyhow::anyhow!("Failed to register tool '{}': {}", spec.id, e))?;
             }
             _ => {
