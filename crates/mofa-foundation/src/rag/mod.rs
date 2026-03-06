@@ -26,6 +26,7 @@ pub use embedding_adapter::{
 };
 pub use retrieval::{
     query_documents, RagQueryConfig, RetrievalResult, RetrievedChunk,
+};
 pub use indexing::{
     index_documents, IndexDocument, IndexMode, IndexResult, RagIndexConfig,
     RagOrchestrationError,
