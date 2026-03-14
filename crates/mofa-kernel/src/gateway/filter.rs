@@ -54,3 +54,10 @@ pub enum FilterResult {
     Return(GatewayResponse),
 }
 
+/// The primary trait that all interceptor patterns (e.g., auth, rate-limit, telemetry) implement.
+#[async_trait]
+pub trait GatewayFilter: Send + Sync + Debug {
+    async fn execute(&self, ctx: FilterContext) -> Result<FilterResult, GatewayError>;
+}
+
+
