@@ -22,6 +22,7 @@
 pub mod auth;
 pub mod envelope;
 pub mod error;
+pub mod filter;
 pub mod route;
 mod config_error;
 mod types;
@@ -35,3 +36,4 @@ pub use error::RegistryError;
 pub use route::{GatewayRoute, HttpMethod, RouteRegistry, RoutingContext};
 pub use config_error::GatewayConfigError;
 pub use types::{GatewayContext, GatewayRequest, GatewayResponse, RouteMatch};
+pub use filter::{FilterContext, FilterResult, GatewayError};
