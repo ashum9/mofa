@@ -36,4 +36,4 @@ pub use error::RegistryError;
 pub use route::{GatewayRoute, HttpMethod, RouteRegistry, RoutingContext};
 pub use config_error::GatewayConfigError;
 pub use types::{GatewayContext, GatewayRequest, GatewayResponse, RouteMatch};
-pub use filter::{FilterContext, FilterResult, GatewayFilter, GatewayError};
+pub use filter::{FilterContext, FilterResult, GatewayFilter, FilterChain, GatewayError};
