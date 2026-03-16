@@ -730,3 +730,183 @@ impl Memory for FileBasedStorage {
         "file-based"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_in_memory_basic_ops() -> AgentResult<()> {
+        let mut storage = InMemoryStorage::new();
+        
+        // Test Store & Retrieve
+        let val1 = MemoryValue::text("test data 1");
+        storage.store("key1", val1.clone()).await?;
+        
+        let retrieved = storage.retrieve("key1").await?;
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().as_text().unwrap(), "test data 1");
+        
+        // Test Remove
+        let removed = storage.remove("key1").await?;
+        assert!(removed);
+        
+        // Verify removal
+        let retrieved_again = storage.retrieve("key1").await?;
+        assert!(retrieved_again.is_none());
+        
+        // Test Clear
+        storage.store("key2", MemoryValue::text("data 2")).await?;
+        storage.clear().await?;
+        
+        let after_clear = storage.retrieve("key2").await?;
+        assert!(after_clear.is_none());
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_search_history() -> AgentResult<()> {
+        let mut storage = InMemoryStorage::new();
+        
+        // Populate data for search
+        storage.store("doc1", MemoryValue::text("The quick brown fox")).await?;
+        storage.store("doc2", MemoryValue::text("Jumps over the lazy dog")).await?;
+        storage.store("doc3", MemoryValue::text("Foxes are very quick and smart")).await?;
+        
+        // Test Search
+        let results = storage.search("quick", 10).await?;
+        assert_eq!(results.len(), 2);
+        
+        // Test History
+        let session_id = "session_xyz";
+        storage.add_to_history(session_id, Message::user("Hello")).await?;
+        storage.add_to_history(session_id, Message::assistant("Hi there")).await?;
+        
+        let history = storage.get_history(session_id).await?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "Hello");
+        assert_eq!(history[1].content, "Hi there");
+        
+        // Test Clear History
+        storage.clear_history(session_id).await?;
+        let empty_history = storage.get_history(session_id).await?;
+        assert!(empty_history.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_file_based_persistence() -> AgentResult<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let session_id = "persistent_session";
+        
+        // Scope 1: Write data
+        {
+            let mut storage = FileBasedStorage::new(temp_dir.path()).await?;
+            storage.store("persist_key", MemoryValue::text("persistent data")).await?;
+            storage.add_to_history(session_id, Message::user("Hello file")).await?;
+            storage.write_long_term("Long term knowledge").await?;
+            storage.append_today("Today note 1").await?;
+        } // Storage object dropped here, data should be on disk
+        
+        // Scope 2: Read data back after restart
+        {
+            let storage2 = FileBasedStorage::new(temp_dir.path()).await?;
+            
+            // Verify key-value persistence
+            let retrieved = storage2.retrieve("persist_key").await?;
+            assert!(retrieved.is_some());
+            assert_eq!(retrieved.unwrap().as_text().unwrap(), "persistent data");
+            
+            // Verify history persistence
+            let history = storage2.get_history(session_id).await?;
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].content, "Hello file");
+            
+            // Verify markdown files
+            let long_term = storage2.read_long_term().await?;
+            assert_eq!(long_term, "Long term knowledge");
+            
+            let today = storage2.read_today().await?;
+            assert!(today.contains("Today note 1"));
+            
+            // Test Search across memory and markdown (daily notes)
+            let search_results = storage2.search("note", 5).await?;
+            assert!(!search_results.is_empty(), "Should find 'note' from today's memory");
+            
+            let search_results2 = storage2.search("persistent", 5).await?;
+            assert!(!search_results2.is_empty(), "Should find 'persistent' from data values");
+        }
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_file_based_clear() -> AgentResult<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        
+        let mut storage = FileBasedStorage::new(temp_dir.path()).await?;
+        storage.store("key_to_clear", MemoryValue::text("data")).await?;
+        storage.add_to_history("clear_sess", Message::user("msg")).await?;
+        
+        storage.clear().await?;
+        
+        // Verify memory is empty
+        let retrieved = storage.retrieve("key_to_clear").await?;
+        assert!(retrieved.is_none());
+        
+        let history = storage.get_history("clear_sess").await?;
+        assert!(history.is_empty());
+        
+        // Verify disk files were removed
+        let data_file = temp_dir.path().join("memory").join("data.json");
+        assert!(!data_file.exists());
+        
+        // Also check sessions dir still exists (or was recreated) but is empty
+        let sessions_dir = temp_dir.path().join("memory").join("sessions");
+        assert!(sessions_dir.exists());
+        let entries = std::fs::read_dir(sessions_dir).expect("Failed to read sessions dir").count();
+        assert_eq!(entries, 0);
+        
+        Ok(())
+    }
+
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn test_file_based_concurrency() -> AgentResult<()> {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let storage = Arc::new(RwLock::new(FileBasedStorage::new(temp_dir.path()).await?));
+        let mut handles = vec![];
+
+        for i in 0..10 {
+            let storage_clone = Arc::clone(&storage);
+            handles.push(tokio::spawn(async move {
+                let key = format!("concurrent_key_{}", i);
+                let mut s = storage_clone.write().await;
+                s.store(&key, MemoryValue::text(format!("data {}", i))).await.unwrap();
+                s.add_to_history("shared_session", Message::user(format!("msg {}", i))).await.unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Verify all 10 were written
+        let s = storage.read().await;
+        for i in 0..10 {
+            let key = format!("concurrent_key_{}", i);
+            let val = s.retrieve(&key).await?.unwrap();
+            assert_eq!(val.as_text().unwrap(), format!("data {}", i));
+        }
+
+        let history = s.get_history("shared_session").await?;
+        assert_eq!(history.len(), 10);
+
+        Ok(())
+    }
+}
