@@ -1,50 +1,31 @@
 use async_trait::async_trait;
-use crate::gateway::{GatewayRequest, GatewayResponse};
+use crate::gateway::{GatewayContext, GatewayRequest, GatewayResponse};
 use std::collections::HashMap;
 use std::fmt::Debug;
+use thiserror::Error;
 
 /// Represents the error states unique to Gateway filtering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum GatewayError {
+    #[error("Unauthorized: {0}")]
     Unauthorized(String),
+    #[error("Rate Limited: {0}")]
     RateLimited(String),
+    #[error("Validation Failed: {0}")]
     ValidationFailed(String),
+    #[error("Internal Error: {0}")]
     Internal(String),
 }
 
-impl std::fmt::Display for GatewayError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
-            Self::RateLimited(msg) => write!(f, "Rate Limited: {}", msg),
-            Self::ValidationFailed(msg) => write!(f, "Validation Failed: {}", msg),
-            Self::Internal(msg) => write!(f, "Internal Error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for GatewayError {}
-
-/// The mutable context passed through the filter chain.
-#[derive(Debug, Clone)]
-pub struct FilterContext {
-    pub request: GatewayRequest,
-    pub metadata: HashMap<String, String>,
-    pub agent_id: Option<String>,
-}
-
-impl FilterContext {
-    pub fn new(request: GatewayRequest) -> Self {
-        Self {
-            request,
-            metadata: HashMap::new(),
-            agent_id: None,
-        }
-    }
-}
+///
+/// This is an alias of [`GatewayContext`], which is the canonical
+/// per-request mutable context type for gateway filters.
+pub use crate::gateway::GatewayContext as FilterContext;
 
 /// The result returned by a single filter.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum FilterResult {
     /// Proceed to the next filter in the chain.
     Pass(FilterContext),

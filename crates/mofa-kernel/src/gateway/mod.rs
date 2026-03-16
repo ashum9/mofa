@@ -10,7 +10,8 @@
 //! | [`GatewayConfigError`] | Error type for gateway configuration validation |
 //! | [`GatewayRequest`] | Inbound HTTP request model |
 //! | [`GatewayResponse`] | Outbound HTTP response model |
-//! | [`GatewayContext`] | Per-request mutable context for filter chains |
+//! | [`GatewayContext`] | Per-request mutable gateway state shared across routing and filters |
+//! | [`FilterContext`] | Canonical per-filter view over the current request/response and gateway state |
 //! | [`RouteMatch`] | Result of a successful route lookup |
 //! | [`RequestEnvelope`] | Typed inbound request envelope flowing through the pipeline |
 //! | [`AgentResponse`] | Typed agent response for access logging, metrics, and admin API |
