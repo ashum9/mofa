@@ -12,6 +12,8 @@
 //! | [`GatewayResponse`] | Outbound HTTP response model |
 //! | [`GatewayContext`] | Per-request mutable gateway state shared across routing and filters |
 //! | [`FilterContext`] | Canonical per-filter view over the current request/response and gateway state |
+//! | [`FilterChain`] | Composable pipeline of [`GatewayFilter`]s executed for each request |
+//! | [`ChainOutcome`] | The result of a FilterChain execution, indicating completion or short-circuit |
 //! | [`RouteMatch`] | Result of a successful route lookup |
 //! | [`RequestEnvelope`] | Typed inbound request envelope flowing through the pipeline |
 //! | [`AgentResponse`] | Typed agent response for access logging, metrics, and admin API |
@@ -37,4 +39,4 @@ pub use error::RegistryError;
 pub use route::{GatewayRoute, HttpMethod, RouteRegistry, RoutingContext};
 pub use config_error::GatewayConfigError;
 pub use types::{GatewayContext, GatewayRequest, GatewayResponse, RouteMatch};
-pub use filter::{FilterContext, FilterResult, GatewayFilter, FilterChain, GatewayError};
+pub use filter::{ChainOutcome, FilterContext, FilterResult, GatewayFilter, FilterChain, GatewayError};
